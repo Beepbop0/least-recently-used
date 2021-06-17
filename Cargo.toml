@@ -1,0 +1,12 @@
+[package]
+authors = ["Beepbop0 <hey.nikhil42@gmail.com>"]
+edition = "2018"
+name = "least-recently-used"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dev-dependencies]
+lru = "0.6.5"
+quickcheck = "1.0.3"
+quickcheck_macros = "1.0.0"
