@@ -65,18 +65,16 @@ impl<K, V> Default for LinkedList<K, V> {
 impl<K, V> LinkedList<K, V> {
     // invariant: Node must not be null
     #[inline]
-    fn push(&mut self, node: *mut Node<K, V>) {
+    unsafe fn push(&mut self, node: *mut Node<K, V>) {
         assert!(!node.is_null());
-        unsafe {
-            let old_head = self.head;
-            (*node).next = old_head;
-            (*node).prev = ptr::null_mut();
-            self.head = node;
-            if old_head.is_null() {
-                self.tail = node;
-            } else {
-                (*old_head).prev = node;
-            }
+        let old_head = self.head;
+        (*node).next = old_head;
+        (*node).prev = ptr::null_mut();
+        self.head = node;
+        if old_head.is_null() {
+            self.tail = node;
+        } else {
+            (*old_head).prev = node;
         }
     }
 
@@ -101,24 +99,22 @@ impl<K, V> LinkedList<K, V> {
 
     // Safety: Assumes this node is from the list and non-null
     #[inline]
-    fn move_front(&mut self, node: *mut Node<K, V>) {
+    unsafe fn move_front(&mut self, node: *mut Node<K, V>) {
         assert!(!node.is_null());
-        unsafe {
-            match (!(*node).prev.is_null(), !(*node).next.is_null()) {
-                // is the head node or the only element in the list
-                (false, true) | (false, false) => return,
-                // pointing to tail node, remove
-                (true, false) => {
-                    self.pop_back();
-                }
-                (true, true) => {
-                    let next = (*node).next;
-                    let prev = (*node).prev;
-                    (*prev).next = next;
-                    (*next).prev = prev;
-                    // not nulling out the node's next and prev pointers since they will be
-                    // overwritten by the push method anyways
-                }
+        match (!(*node).prev.is_null(), !(*node).next.is_null()) {
+            // is the head node or the only element in the list
+            (false, true) | (false, false) => return,
+            // pointing to tail node, remove
+            (true, false) => {
+                self.pop_back();
+            }
+            (true, true) => {
+                let next = (*node).next;
+                let prev = (*node).prev;
+                (*prev).next = next;
+                (*next).prev = prev;
+                // not nulling out the node's next and prev pointers since they will be
+                // overwritten by the push method anyways
             }
         }
         self.push(node);
@@ -190,20 +186,20 @@ where
 
     pub fn get<'a>(&'a mut self, key: &K) -> Option<&'a V> {
         match self.cache.get_mut(key) {
-            Some(&mut node) => {
+            Some(&mut node) => unsafe {
                 self.list.move_front(node);
-                Some(unsafe { &(*node).val })
-            }
+                Some(&(*node).val)
+            },
             _ => None,
         }
     }
 
     pub fn get_mut<'a>(&'a mut self, key: &K) -> Option<&'a mut V> {
         match self.cache.get_mut(key) {
-            Some(node) => {
+            Some(node) => unsafe {
                 self.list.move_front(*node);
-                Some(unsafe { &mut (**node).val })
-            }
+                Some(&mut (**node).val)
+            },
             _ => None,
         }
     }
@@ -219,9 +215,11 @@ where
     pub fn remove_lru(&mut self) -> Option<(K, V)> {
         let lru = self.list.pop_back();
         (!lru.is_null()).then(|| {
-            let boxed = unsafe { Box::from_raw(lru) };
-            self.cache.remove(&boxed.key);
-            (boxed.key, boxed.val)
+            let key = unsafe { &(*lru).key };
+            let node = self.cache.remove(key).unwrap();
+            let boxed = unsafe { Box::from_raw(node) };
+            let (key, val) = (boxed.key, boxed.val);
+            (key, val)
         })
     }
 
@@ -229,7 +227,7 @@ where
         let key_ref = KeyRef(&key as *const _);
         if let Some(&mut existing_entry) = self.cache.get_mut(&key_ref) {
             let old_val = unsafe { std::mem::replace(&mut (*existing_entry).val, val) };
-            self.list.move_front(existing_entry);
+            unsafe { self.list.move_front(existing_entry) };
             Some(old_val)
         } else {
             let (key_ref, new_node) = if self.cache.len() + 1 > self.cap.get() {
@@ -245,7 +243,7 @@ where
                 let new_node = Box::new(Node::new(key, val));
                 (KeyRef(&new_node.key as *const _), Box::into_raw(new_node))
             };
-            self.list.push(new_node);
+            unsafe { self.list.push(new_node) };
             self.cache.insert(key_ref, new_node);
             None
         }
@@ -319,42 +317,117 @@ pub mod tests {
 #[cfg(test)]
 mod quickcheck_tests {
     use super::LRUCache;
-    use lru::LruCache as SafeLRU;
     use quickcheck::{self, Arbitrary, Gen};
     use quickcheck_macros::*;
+    use std::collections::hash_map::{Entry, HashMap};
+    use std::hash::Hash;
     use std::num::{NonZeroU16, NonZeroUsize};
 
+    struct SafeLRU<K, V> {
+        cache: HashMap<K, V>,
+        recency: Vec<K>,
+        cap: NonZeroUsize,
+    }
+
+    impl<K: Hash + Eq, V> SafeLRU<K, V> {
+        fn new(cap: NonZeroUsize) -> Self {
+            Self {
+                cache: HashMap::with_capacity(cap.get().saturating_add(1)),
+                recency: Vec::with_capacity(cap.get()),
+                cap,
+            }
+        }
+
+        fn get(&mut self, key: &K) -> Option<&V> {
+            match self.cache.get(key) {
+                Some(val) => {
+                    move_front(&mut self.recency, key);
+                    Some(val)
+                }
+                _ => None,
+            }
+        }
+
+        fn put(&mut self, key: K, val: V) -> Option<V>
+        where
+            K: Clone,
+        {
+            if let Entry::Occupied(mut occ) = self.cache.entry(key.clone()) {
+                let old = occ.insert(val);
+                move_front(&mut self.recency, &key);
+                Some(old)
+            } else {
+                if self.cache.len() + 1 > self.cap.get() {
+                    let lru = self.recency.pop().unwrap();
+                    self.cache.remove(&lru);
+                }
+                self.cache.insert(key.clone(), val);
+                self.recency.insert(0, key);
+                None
+            }
+        }
+
+        fn remove(&mut self, key: &K) -> Option<V> {
+            let val = self.cache.remove(key)?;
+            remove_key(&mut self.recency, key);
+            Some(val)
+        }
+
+        fn remove_lru(&mut self) -> Option<(K, V)> {
+            let lru = self.recency.pop()?;
+            self.cache.remove_entry(&lru)
+        }
+    }
+
+    fn move_front<K: Eq>(recency: &mut Vec<K>, key: &K) {
+        let removed_key = remove_key(recency, key);
+        recency.insert(0, removed_key);
+    }
+
+    fn remove_key<K: Eq>(recency: &mut Vec<K>, key: &K) -> K {
+        let remove_index = find_first(recency.as_slice(), &key).unwrap();
+        recency.remove(remove_index)
+    }
+
+    fn find_first<T: Eq>(slice: &[T], elem: &T) -> Option<usize> {
+        slice
+            .into_iter()
+            .enumerate()
+            .find(|(_, x)| elem == *x)
+            .map(|(i, _)| i)
+    }
+
     #[derive(Debug, Clone)]
-    enum Op {
-        Get(i8),
-        Put(i8, i8),
-        Remove(i8),
+    enum Op<T> {
+        Get(T),
+        Put(T, T),
+        Remove(T),
         RemoveLru,
     }
 
-    impl Arbitrary for Op {
+    impl<T: Arbitrary> Arbitrary for Op<T> {
         fn arbitrary(g: &mut Gen) -> Self {
             let (a, b) = (bool::arbitrary(g), bool::arbitrary(g));
             match (a, b) {
-                (true, true) => Self::Put(i8::arbitrary(g), i8::arbitrary(g)),
-                (true, false) => Self::Get(i8::arbitrary(g)),
-                (false, true) => Self::Remove(i8::arbitrary(g)),
+                (true, true) => Self::Put(T::arbitrary(g), T::arbitrary(g)),
+                (true, false) => Self::Get(T::arbitrary(g)),
+                (false, true) => Self::Remove(T::arbitrary(g)),
                 (false, false) => Self::RemoveLru,
             }
         }
     }
 
     #[quickcheck]
-    fn same_results(cap: NonZeroU16, operations: Vec<Op>) -> bool {
+    fn same_results(cap: NonZeroU16, operations: Vec<Op<Box<i8>>>) -> bool {
         let cap = NonZeroUsize::from(cap);
         let mut unsafe_lru = LRUCache::with_capacity(cap);
-        let mut safe_lru = SafeLRU::new(cap.get());
+        let mut safe_lru = SafeLRU::new(cap);
 
         operations.into_iter().all(|op| match op {
             Op::Get(key) => unsafe_lru.get(&key) == safe_lru.get(&key),
-            Op::Put(key, val) => unsafe_lru.put(key, val) == safe_lru.put(key, val),
-            Op::Remove(key) => unsafe_lru.remove(&key) == safe_lru.pop(&key),
-            Op::RemoveLru => unsafe_lru.remove_lru() == safe_lru.pop_lru(),
+            Op::Put(key, val) => unsafe_lru.put(key.clone(), val.clone()) == safe_lru.put(key, val),
+            Op::Remove(key) => unsafe_lru.remove(&key) == safe_lru.remove(&key),
+            Op::RemoveLru => unsafe_lru.remove_lru() == safe_lru.remove_lru(),
         })
     }
 
@@ -371,8 +444,8 @@ mod quickcheck_tests {
         run_scenario(cap, operations);
     }
 
-    fn run_scenario(cap: NonZeroUsize, operations: Vec<Op>) {
-        let mut safe_lru = SafeLRU::new(cap.get());
+    fn run_scenario(cap: NonZeroUsize, operations: Vec<Op<i8>>) {
+        let mut safe_lru = SafeLRU::new(cap);
         let mut unsafe_lru = LRUCache::with_capacity(cap);
         for op in operations {
             match op {
@@ -383,10 +456,10 @@ mod quickcheck_tests {
                     assert_eq!(unsafe_lru.put(put_key, val), safe_lru.put(put_key, val),);
                 }
                 Op::Remove(remove_key) => {
-                    assert_eq!(unsafe_lru.remove(&remove_key), safe_lru.pop(&remove_key))
+                    assert_eq!(unsafe_lru.remove(&remove_key), safe_lru.remove(&remove_key))
                 }
                 Op::RemoveLru => {
-                    assert_eq!(unsafe_lru.remove_lru(), safe_lru.pop_lru())
+                    assert_eq!(unsafe_lru.remove_lru(), safe_lru.remove_lru())
                 }
             }
         }
