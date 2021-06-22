@@ -3,28 +3,28 @@ use std::borrow::Borrow;
 use std::collections::hash_map::HashMap;
 use std::hash::{self, Hash};
 use std::num::NonZeroUsize;
-use std::ptr;
+use std::ptr::NonNull;
 
 #[derive(Debug)]
 pub struct Node<K, V> {
     key: K,
     val: V,
-    next: *mut Node<K, V>,
-    prev: *mut Node<K, V>,
+    next: Option<NonNull<Node<K, V>>>,
+    prev: Option<NonNull<Node<K, V>>>,
 }
 
 #[derive(Debug)]
-struct KeyRef<K>(*const K);
+struct KeyRef<K>(NonNull<K>);
 
 impl<K: Hash> Hash for KeyRef<K> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        unsafe { (*self.0).hash(state) }
+        (unsafe { self.0.as_ref() }).hash(state)
     }
 }
 
 impl<K: PartialEq> PartialEq for KeyRef<K> {
     fn eq(&self, other: &KeyRef<K>) -> bool {
-        unsafe { (*self.0).eq(&(*other.0)) }
+        unsafe { self.0.as_ref().eq(other.0.as_ref()) }
     }
 }
 
@@ -32,7 +32,7 @@ impl<K: Eq> Eq for KeyRef<K> {}
 
 impl<K> Borrow<K> for KeyRef<K> {
     fn borrow(&self) -> &K {
-        unsafe { &*self.0 }
+        unsafe { self.0.as_ref() }
     }
 }
 
@@ -41,107 +41,94 @@ impl<K, V> Node<K, V> {
         Self {
             key,
             val,
-            next: ptr::null_mut(),
-            prev: ptr::null_mut(),
+            next: None,
+            prev: None,
         }
     }
 }
 
 #[derive(Debug)]
 struct LinkedList<K, V> {
-    head: *mut Node<K, V>,
-    tail: *mut Node<K, V>,
+    head: Option<NonNull<Node<K, V>>>,
+    tail: Option<NonNull<Node<K, V>>>,
 }
 
 impl<K, V> Default for LinkedList<K, V> {
     fn default() -> Self {
         Self {
-            head: ptr::null_mut(),
-            tail: ptr::null_mut(),
+            head: None,
+            tail: None,
         }
     }
 }
 
 impl<K, V> LinkedList<K, V> {
-    // invariant: Node must not be null
     #[inline]
-    unsafe fn push(&mut self, node: *mut Node<K, V>) {
-        assert!(!node.is_null());
-        let old_head = self.head;
-        (*node).next = old_head;
-        (*node).prev = ptr::null_mut();
-        self.head = node;
-        if old_head.is_null() {
-            self.tail = node;
-        } else {
-            (*old_head).prev = node;
-        }
-    }
-
-    #[inline]
-    fn pop_back(&mut self) -> *mut Node<K, V> {
-        let lru = self.tail;
-
-        if !lru.is_null() {
-            unsafe {
-                self.tail = (*lru).prev;
-                (*lru).prev = ptr::null_mut();
-                if self.tail.is_null() {
-                    self.head = ptr::null_mut()
-                } else {
-                    (*self.tail).next = ptr::null_mut();
-                }
+    fn push(&mut self, mut node: NonNull<Node<K, V>>) {
+        unsafe {
+            let old_head = std::mem::replace(&mut self.head, Some(node));
+            let node_ref = node.as_mut();
+            node_ref.next = old_head;
+            node_ref.prev = None;
+            match old_head {
+                None => self.tail = Some(node),
+                Some(mut old_head) => old_head.as_mut().prev = Some(node),
             }
         }
-
-        lru
     }
 
-    // Safety: Assumes this node is from the list and non-null
     #[inline]
-    unsafe fn move_front(&mut self, node: *mut Node<K, V>) {
-        assert!(!node.is_null());
-        match (!(*node).prev.is_null(), !(*node).next.is_null()) {
-            // is the head node or the only element in the list
-            (false, true) | (false, false) => return,
-            // pointing to tail node, remove
-            (true, false) => {
+    fn pop_back(&mut self) -> Option<NonNull<Node<K, V>>> {
+        match self.tail.take() {
+            Some(mut lru) => unsafe {
+                let lru_ref = lru.as_mut();
+                self.tail = lru_ref.prev.take();
+                match self.tail {
+                    None => self.head = None,
+                    Some(mut tail) => tail.as_mut().next = None,
+                }
+                Some(lru)
+            },
+            _ => None,
+        }
+    }
+
+    // Safety: Assumes this node is from the list
+    #[inline]
+    unsafe fn move_front(&mut self, mut node: NonNull<Node<K, V>>) {
+        let node_ref = node.as_mut();
+        match (node_ref.prev, node_ref.next) {
+            // already at the front
+            (None, Some(_)) | (None, None) => return,
+            (Some(_), None) => {
                 self.pop_back();
             }
-            (true, true) => {
-                let next = (*node).next;
-                let prev = (*node).prev;
-                (*prev).next = next;
-                (*next).prev = prev;
-                // not nulling out the node's next and prev pointers since they will be
-                // overwritten by the push method anyways
+            (Some(mut prev), Some(mut next)) => {
+                prev.as_mut().next = Some(next);
+                next.as_mut().prev = Some(prev);
             }
         }
         self.push(node);
     }
 
+    // Safety: Assumes this node is from the list
     #[inline]
-    fn unlink(&mut self, node: *mut Node<K, V>) {
-        assert!(!node.is_null());
-        unsafe {
-            if (*node).prev.is_null() {
-                self.head = (*node).next;
-            } else {
-                (*(*node).prev).next = (*node).next;
-            }
-
-            if (*node).next.is_null() {
-                self.tail = (*node).prev;
-            } else {
-                (*(*node).next).prev = (*node).prev;
-            }
+    unsafe fn unlink(&mut self, mut node: NonNull<Node<K, V>>) {
+        let node = node.as_mut();
+        match node.prev {
+            None => self.head = node.next,
+            Some(mut prev) => prev.as_mut().next = node.next,
+        }
+        match node.next {
+            None => self.tail = node.prev,
+            Some(mut next) => next.as_mut().prev = node.prev,
         }
     }
 }
 
 #[derive(Debug)]
 struct LRUCache<K, V> {
-    cache: HashMap<KeyRef<K>, *mut Node<K, V>>,
+    cache: HashMap<KeyRef<K>, NonNull<Node<K, V>>>,
     list: LinkedList<K, V>,
     cap: NonZeroUsize,
 }
@@ -169,10 +156,10 @@ impl<K, V> LRUCache<K, V> {
 
     pub fn clear(&mut self) {
         for (_, entry) in self.cache.drain() {
-            let _ = unsafe { Box::from_raw(entry) };
+            let _ = unsafe { Box::from_raw(entry.as_ptr()) };
         }
-        self.list.head = ptr::null_mut();
-        self.list.tail = ptr::null_mut();
+        self.list.head = None;
+        self.list.tail = None;
     }
 }
 
@@ -188,7 +175,7 @@ where
         match self.cache.get_mut(key) {
             Some(&mut node) => unsafe {
                 self.list.move_front(node);
-                Some(&(*node).val)
+                Some(&node.as_ref().val)
             },
             _ => None,
         }
@@ -196,54 +183,59 @@ where
 
     pub fn get_mut<'a>(&'a mut self, key: &K) -> Option<&'a mut V> {
         match self.cache.get_mut(key) {
-            Some(node) => unsafe {
-                self.list.move_front(*node);
-                Some(&mut (**node).val)
+            Some(&mut mut node) => unsafe {
+                self.list.move_front(node);
+                Some(&mut node.as_mut().val)
             },
             _ => None,
         }
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.cache.remove(key).map(|node| {
+        self.cache.remove(key).map(|node| unsafe {
             self.list.unlink(node);
-            let boxed = unsafe { Box::from_raw(node) };
+            let boxed = Box::from_raw(node.as_ptr());
             boxed.val
         })
     }
 
     pub fn remove_lru(&mut self) -> Option<(K, V)> {
-        let lru = self.list.pop_back();
-        (!lru.is_null()).then(|| {
-            let key = unsafe { &(*lru).key };
-            let node = self.cache.remove(key).unwrap();
-            let boxed = unsafe { Box::from_raw(node) };
-            let (key, val) = (boxed.key, boxed.val);
-            (key, val)
-        })
+        match self.list.pop_back() {
+            Some(lru) => {
+                let key = unsafe { &lru.as_ref().key };
+                let node = self.cache.remove(key).unwrap();
+                let boxed = unsafe { Box::from_raw(node.as_ptr()) };
+                Some((boxed.key, boxed.val))
+            }
+            _ => None,
+        }
     }
 
     pub fn put(&mut self, key: K, val: V) -> Option<V> {
-        let key_ref = KeyRef(&key as *const _);
-        if let Some(&mut existing_entry) = self.cache.get_mut(&key_ref) {
-            let old_val = unsafe { std::mem::replace(&mut (*existing_entry).val, val) };
-            unsafe { self.list.move_front(existing_entry) };
-            Some(old_val)
+        let key_ref = KeyRef(NonNull::from(&key));
+        if let Some(&mut mut existing_entry) = self.cache.get_mut(&key_ref) {
+            unsafe {
+                let old_val = std::mem::replace(&mut existing_entry.as_mut().val, val);
+                self.list.move_front(existing_entry);
+                Some(old_val)
+            }
         } else {
             let (key_ref, new_node) = if self.cache.len() + 1 > self.cap.get() {
                 unsafe {
                     // SAFETY: the above condition + non-zero capacity means we should never pop a null node
-                    let lru_key = &(*self.list.pop_back()).key;
+                    let lru_key = &self.list.pop_back().unwrap().as_ref().key;
                     let mut lru_node = self.cache.remove(lru_key).unwrap();
-                    (*lru_node).key = key;
-                    (*lru_node).val = val;
-                    (KeyRef(&(*lru_node).key as *const _), lru_node)
+                    lru_node.as_mut().key = key;
+                    lru_node.as_mut().val = val;
+                    (KeyRef(NonNull::from(&lru_node.as_ref().key)), lru_node)
                 }
             } else {
                 let new_node = Box::new(Node::new(key, val));
-                (KeyRef(&new_node.key as *const _), Box::into_raw(new_node))
+                (KeyRef(NonNull::from(&new_node.key)), unsafe {
+                    NonNull::new_unchecked(Box::into_raw(new_node))
+                })
             };
-            unsafe { self.list.push(new_node) };
+            self.list.push(new_node);
             self.cache.insert(key_ref, new_node);
             None
         }
