@@ -18,6 +18,8 @@ jobs:
     - uses: actions/checkout@v2
     - name: Install nightly toolchain
       run: rustup toolchain add nightly
+    - name: Set default toolchain to stable
+      run: rustup default stable
     - name: Install miri
       run: rustup component add --toolchain nightly miri
     - name: Build
