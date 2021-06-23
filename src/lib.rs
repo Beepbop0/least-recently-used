@@ -2,6 +2,7 @@
 use std::borrow::Borrow;
 use std::collections::hash_map::HashMap;
 use std::hash::{self, Hash};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
@@ -181,6 +182,12 @@ where
         }
     }
 
+    pub fn peek<'a>(&'a self, key: &K) -> Option<&'a V> {
+        self.cache
+            .get(key)
+            .map(|node| unsafe { &node.as_ref().val })
+    }
+
     pub fn get_mut<'a>(&'a mut self, key: &K) -> Option<&'a mut V> {
         match self.cache.get_mut(key) {
             Some(&mut mut node) => unsafe {
@@ -189,6 +196,18 @@ where
             },
             _ => None,
         }
+    }
+
+    pub fn peek_mut<'a>(&'a mut self, key: &K) -> Option<&'a mut V> {
+        self.cache
+            .get_mut(key)
+            .map(|node| unsafe { &mut node.as_mut().val })
+    }
+
+    pub fn peek_lru<'a>(&'a self) -> Option<(&'a K, &'a V)> {
+        self.list
+            .tail
+            .map(|node| unsafe { (&node.as_ref().key, &node.as_ref().val) })
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
@@ -240,11 +259,143 @@ where
             None
         }
     }
+
+    pub fn resize(&mut self, cap: NonZeroUsize) {
+        if self.cap == cap {
+            return;
+        }
+
+        while self.cache.len() > cap.get() {
+            self.remove_lru();
+        }
+        self.cache.shrink_to_fit();
+        self.cap = cap;
+    }
+
+    pub fn iter<'a>(&'a self) -> Iter<'a, K, V> {
+        IntoIterator::into_iter(self)
+    }
+
+    pub fn iter_mut<'a>(&'a mut self) -> IterMut<'a, K, V> {
+        IntoIterator::into_iter(self)
+    }
 }
 
 impl<K, V> Drop for LRUCache<K, V> {
     fn drop(&mut self) {
         self.clear()
+    }
+}
+
+impl<K, V> Clone for LRUCache<K, V>
+where
+    K: Hash + Eq + Clone,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        let mut new_cache = LRUCache::with_capacity(self.cap);
+        // insert from least-used to most used
+        for (k, v) in self.into_iter().rev() {
+            new_cache.put(k.clone(), v.clone());
+        }
+
+        new_cache
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a LRUCache<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Iter {
+            next: self.list.head,
+            prev: self.list.tail,
+            len: self.len(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+struct Iter<'a, K, V> {
+    next: Option<NonNull<Node<K, V>>>,
+    prev: Option<NonNull<Node<K, V>>>,
+    len: usize,
+    _marker: PhantomData<&'a Node<K, V>>,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next.map(|node| unsafe {
+            let ret = (&node.as_ref().key, &node.as_ref().val);
+            self.next = node.as_ref().next;
+            ret
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.prev.map(|node| unsafe {
+            let ret = (&node.as_ref().key, &node.as_ref().val);
+            self.prev = node.as_ref().prev;
+            ret
+        })
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {}
+
+impl<'a, K, V> IntoIterator for &'a mut LRUCache<K, V> {
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IterMut {
+            next: self.list.head,
+            prev: self.list.tail,
+            len: self.len(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+struct IterMut<'a, K, V> {
+    next: Option<NonNull<Node<K, V>>>,
+    prev: Option<NonNull<Node<K, V>>>,
+    len: usize,
+    _marker: PhantomData<&'a mut Node<K, V>>,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next.map(|mut node| unsafe {
+            let ret = (&node.as_ref().key, &mut node.as_mut().val);
+            self.next = node.as_mut().next;
+            ret
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.prev.map(|mut node| unsafe {
+            let ret = (&node.as_ref().key, &mut node.as_mut().val);
+            self.prev = node.as_mut().prev;
+            ret
+        })
     }
 }
 
@@ -304,6 +455,19 @@ pub mod tests {
         lru_cache.remove(&1);
         assert_eq!(lru_cache.remove_lru(), None);
     }
+
+    #[test]
+    fn clone_creates_lru_with_same_recency_ordering() {
+        let mut lru_cache = LRUCache::with_capacity(NonZeroUsize::new(2).unwrap());
+        lru_cache.put('a', 'a');
+        lru_cache.put('z', 'z');
+        lru_cache.put('i', 'j');
+        let duplicate = lru_cache.clone();
+        for ((k1, v1), (k2, v2)) in lru_cache.iter().zip(duplicate.iter()) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +494,27 @@ mod quickcheck_tests {
             }
         }
 
+        fn len(&self) -> usize {
+            self.cache.len()
+        }
+
+        fn cap(&self) -> usize {
+            self.cap.get()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.cache.is_empty()
+        }
+
+        fn clear(&mut self) {
+            self.cache.clear();
+            self.recency.clear();
+        }
+
+        fn contains(&self, key: &K) -> bool {
+            self.cache.contains_key(key)
+        }
+
         fn get(&mut self, key: &K) -> Option<&V> {
             match self.cache.get(key) {
                 Some(val) => {
@@ -338,6 +523,29 @@ mod quickcheck_tests {
                 }
                 _ => None,
             }
+        }
+
+        fn peek(&self, key: &K) -> Option<&V> {
+            self.cache.get(key)
+        }
+
+        fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+            match self.cache.get_mut(key) {
+                Some(val) => {
+                    move_front(&mut self.recency, key);
+                    Some(val)
+                }
+                _ => None,
+            }
+        }
+
+        fn peek_mut(&mut self, key: &K) -> Option<&mut V> {
+            self.cache.get_mut(key)
+        }
+
+        fn peek_lru(&self) -> Option<(&K, &V)> {
+            let lru_key = self.recency.last()?;
+            self.cache.get_key_value(lru_key)
         }
 
         fn put(&mut self, key: K, val: V) -> Option<V>
@@ -369,6 +577,18 @@ mod quickcheck_tests {
             let lru = self.recency.pop()?;
             self.cache.remove_entry(&lru)
         }
+
+        fn resize(&mut self, cap: NonZeroUsize) {
+            if self.cap == cap {
+                return;
+            }
+
+            while self.cache.len() > cap.get() {
+                self.remove_lru();
+            }
+            self.cache.shrink_to_fit();
+            self.cap = cap;
+        }
     }
 
     fn move_front<K: Eq>(recency: &mut Vec<K>, key: &K) {
@@ -389,22 +609,75 @@ mod quickcheck_tests {
             .map(|(i, _)| i)
     }
 
+    impl<'a, K, V> IntoIterator for &'a SafeLRU<K, V>
+    where
+        K: Hash + Eq,
+    {
+        type Item = (&'a K, &'a V);
+        type IntoIter = Iter<'a, K, V>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            Iter {
+                cache: self,
+                iter: self.recency.iter(),
+            }
+        }
+    }
+
+    struct Iter<'a, K, V> {
+        cache: &'a SafeLRU<K, V>,
+        iter: std::slice::Iter<'a, K>,
+    }
+
+    impl<'a, K, V> Iterator for Iter<'a, K, V>
+    where
+        K: Hash + Eq,
+    {
+        type Item = (&'a K, &'a V);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.iter.next().map(|k| {
+                let v = self.cache.peek(k).unwrap();
+                (k, v)
+            })
+        }
+    }
+
+    impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V>
+    where
+        K: Hash + Eq,
+    {
+        fn next_back(&mut self) -> Option<Self::Item> {
+            self.iter.next_back().map(|k| {
+                let v = self.cache.peek(k).unwrap();
+                (k, v)
+            })
+        }
+    }
+
     #[derive(Debug, Clone)]
     enum Op<T> {
         Get(T),
         Put(T, T),
         Remove(T),
+        Resize(NonZeroUsize),
         RemoveLru,
+        Clear,
+        Len,
+        IsEmpty,
     }
 
     impl<T: Arbitrary> Arbitrary for Op<T> {
         fn arbitrary(g: &mut Gen) -> Self {
-            let (a, b) = (bool::arbitrary(g), bool::arbitrary(g));
-            match (a, b) {
-                (true, true) => Self::Put(T::arbitrary(g), T::arbitrary(g)),
-                (true, false) => Self::Get(T::arbitrary(g)),
-                (false, true) => Self::Remove(T::arbitrary(g)),
-                (false, false) => Self::RemoveLru,
+            match (bool::arbitrary(g), bool::arbitrary(g), bool::arbitrary(g)) {
+                (false, false, false) => Self::Put(T::arbitrary(g), T::arbitrary(g)),
+                (false, false, true) => Self::Get(T::arbitrary(g)),
+                (false, true, false) => Self::Remove(T::arbitrary(g)),
+                (false, true, true) => Self::Resize(NonZeroUsize::arbitrary(g)),
+                (true, false, false) => Self::RemoveLru,
+                (true, false, true) => Self::Clear,
+                (true, true, false) => Self::Len,
+                (true, true, true) => Self::IsEmpty,
             }
         }
     }
@@ -419,8 +692,41 @@ mod quickcheck_tests {
             Op::Get(key) => unsafe_lru.get(&key) == safe_lru.get(&key),
             Op::Put(key, val) => unsafe_lru.put(key.clone(), val.clone()) == safe_lru.put(key, val),
             Op::Remove(key) => unsafe_lru.remove(&key) == safe_lru.remove(&key),
+            Op::Resize(cap) => {
+                unsafe_lru.resize(cap);
+                safe_lru.resize(cap);
+                unsafe_lru.peek_lru() == safe_lru.peek_lru()
+            }
             Op::RemoveLru => unsafe_lru.remove_lru() == safe_lru.remove_lru(),
+            Op::Clear => {
+                unsafe_lru.clear();
+                safe_lru.clear();
+                unsafe_lru.is_empty() && safe_lru.is_empty()
+            }
+            Op::Len => unsafe_lru.len() == safe_lru.len(),
+            Op::IsEmpty => unsafe_lru.is_empty() == safe_lru.is_empty(),
         })
+    }
+
+    #[quickcheck]
+    fn iters_behave_same(cap: NonZeroU16, elements: Vec<(i8, i8)>) -> bool {
+        let cap = NonZeroUsize::from(cap);
+        let mut safe_lru = SafeLRU::new(cap);
+        let mut unsafe_lru = LRUCache::with_capacity(cap);
+        for (k, v) in elements {
+            safe_lru.put(k, v);
+            unsafe_lru.put(k, v);
+        }
+
+        safe_lru
+            .into_iter()
+            .zip(unsafe_lru.into_iter())
+            .all(|(x, y)| x == y)
+            && safe_lru
+                .into_iter()
+                .rev()
+                .zip(unsafe_lru.into_iter().rev())
+                .all(|(x, y)| x == y)
     }
 
     #[test]
@@ -450,8 +756,25 @@ mod quickcheck_tests {
                 Op::Remove(remove_key) => {
                     assert_eq!(unsafe_lru.remove(&remove_key), safe_lru.remove(&remove_key))
                 }
+                Op::Resize(cap) => {
+                    unsafe_lru.resize(cap);
+                    safe_lru.resize(cap);
+                    assert_eq!(unsafe_lru.peek_lru(), safe_lru.peek_lru())
+                }
                 Op::RemoveLru => {
                     assert_eq!(unsafe_lru.remove_lru(), safe_lru.remove_lru())
+                }
+                Op::Clear => {
+                    unsafe_lru.clear();
+                    safe_lru.clear();
+                    assert!(unsafe_lru.is_empty() && safe_lru.is_empty());
+                }
+
+                Op::Len => {
+                    assert_eq!(unsafe_lru.len(), safe_lru.len())
+                }
+                Op::IsEmpty => {
+                    assert_eq!(unsafe_lru.is_empty(), safe_lru.is_empty())
                 }
             }
         }
