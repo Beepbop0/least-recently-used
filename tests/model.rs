@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use least_recently_used::LRUCache;
-use quickcheck::{self, Arbitrary, Gen};
+use quickcheck::{self, Arbitrary, Gen, TestResult};
 use quickcheck_macros::*;
 use std::collections::hash_map::{Entry, HashMap};
 use std::hash::Hash;
@@ -118,6 +118,10 @@ impl<K: Hash + Eq, V> SafeLRU<K, V> {
         self.cache.shrink_to_fit();
         self.cap = cap;
     }
+
+    fn iter(&self) -> impl DoubleEndedIterator + ExactSizeIterator<Item = (&K, &V)> {
+        self.recency.iter().map(move |k| (k, &self.cache[k]))
+    }
 }
 
 fn move_front<K: Eq>(recency: &mut Vec<K>, key: &K) {
@@ -138,49 +142,21 @@ fn find_first<T: Eq>(slice: &[T], elem: &T) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-impl<'a, K, V> IntoIterator for &'a SafeLRU<K, V>
-where
-    K: Hash + Eq,
-{
-    type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V>;
+#[derive(Debug, Clone)]
+enum IterOp {
+    Next,
+    NextBack,
+    ExactSize,
+}
 
-    fn into_iter(self) -> Self::IntoIter {
-        Iter {
-            cache: self,
-            iter: self.recency.iter(),
+impl Arbitrary for IterOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u16::arbitrary(g) % 3 {
+            0 => Self::Next,
+            1 => Self::NextBack,
+            2 => Self::ExactSize,
+            _ => unreachable!(),
         }
-    }
-}
-
-struct Iter<'a, K, V> {
-    cache: &'a SafeLRU<K, V>,
-    iter: std::slice::Iter<'a, K>,
-}
-
-impl<'a, K, V> Iterator for Iter<'a, K, V>
-where
-    K: Hash + Eq,
-{
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|k| {
-            let v = self.cache.peek(k).unwrap();
-            (k, v)
-        })
-    }
-}
-
-impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V>
-where
-    K: Hash + Eq,
-{
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.iter.next_back().map(|k| {
-            let v = self.cache.peek(k).unwrap();
-            (k, v)
-        })
     }
 }
 
@@ -235,6 +211,33 @@ fn same_results(cap: NonZeroU16, operations: Vec<Op<Box<i8>>>) -> bool {
         Op::Len => unsafe_lru.len() == safe_lru.len(),
         Op::IsEmpty => unsafe_lru.is_empty() == safe_lru.is_empty(),
     })
+}
+
+#[quickcheck]
+fn iterators_behave_same(values: Vec<(u8, u8)>, operations: Vec<IterOp>) -> TestResult {
+    if values.is_empty() {
+        TestResult::discard()
+    } else {
+        let cap = unsafe { NonZeroUsize::new_unchecked(values.capacity()) };
+        let mut unsafe_lru = LRUCache::with_capacity(cap);
+        let mut safe_lru = SafeLRU::new(cap);
+        for (k, v) in values {
+            unsafe_lru.put(k, v);
+            safe_lru.put(k, v);
+        }
+
+        let mut unsafe_iter = unsafe_lru.iter();
+        let mut safe_iter = safe_lru.iter();
+        if operations.into_iter().all(|op| match op {
+            IterOp::Next => unsafe_iter.next() == safe_iter.next(),
+            IterOp::NextBack => unsafe_iter.next_back() == safe_iter.next_back(),
+            IterOp::ExactSize => unsafe_iter.len() == safe_iter.len(),
+        }) {
+            TestResult::passed()
+        } else {
+            TestResult::failed()
+        }
+    }
 }
 
 #[test]

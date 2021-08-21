@@ -327,11 +327,16 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next.map(|node| unsafe {
-            let ret = (&node.as_ref().key, &node.as_ref().val);
-            self.next = node.as_ref().next;
-            ret
-        })
+        if self.len == 0 {
+            None
+        } else {
+            self.next.map(|node| unsafe {
+                let ret = (&node.as_ref().key, &node.as_ref().val);
+                self.next = node.as_ref().next;
+                self.len -= 1;
+                ret
+            })
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -341,11 +346,16 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 
 impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.prev.map(|node| unsafe {
-            let ret = (&node.as_ref().key, &node.as_ref().val);
-            self.prev = node.as_ref().prev;
-            ret
-        })
+        if self.len == 0 {
+            None
+        } else {
+            self.prev.map(|node| unsafe {
+                let ret = (&node.as_ref().key, &node.as_ref().val);
+                self.prev = node.as_ref().prev;
+                self.len -= 1;
+                ret
+            })
+        }
     }
 }
 
@@ -376,11 +386,16 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next.map(|mut node| unsafe {
-            let ret = (&node.as_ref().key, &mut node.as_mut().val);
-            self.next = node.as_mut().next;
-            ret
-        })
+        if self.len == 0 {
+            None
+        } else {
+            self.next.map(|mut node| unsafe {
+                let ret = (&node.as_ref().key, &mut node.as_mut().val);
+                self.next = node.as_mut().next;
+                self.len -= 1;
+                ret
+            })
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -390,11 +405,15 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
 
 impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.prev.map(|mut node| unsafe {
-            let ret = (&node.as_ref().key, &mut node.as_mut().val);
-            self.prev = node.as_mut().prev;
-            ret
-        })
+        if self.len == 0 {
+            None
+        } else {
+            self.prev.map(|mut node| unsafe {
+                let ret = (&node.as_ref().key, &mut node.as_mut().val);
+                self.prev = node.as_mut().prev;
+                ret
+            })
+        }
     }
 }
 
@@ -472,15 +491,14 @@ pub mod tests {
 
     #[test]
     fn foward_backwards_iters_work() {
-        let mut lru_cache = LRUCache::with_capacity(NonZeroUsize::new(2).unwrap());
+        let mut lru_cache = LRUCache::with_capacity(NonZeroUsize::new(3).unwrap());
         lru_cache.put('y', 'x');
         lru_cache.put('a', 'z');
         lru_cache.put('1', '0');
         let mut iter = lru_cache.iter();
         assert_eq!(iter.next(), Some((&'1', &'0')));
+        assert_eq!(iter.next_back(), Some((&'y', &'x')));
         assert_eq!(iter.next_back(), Some((&'a', &'z')));
-        assert_eq!(iter.next(), Some((&'a', &'z')));
-        assert_eq!(iter.next_back(), Some((&'1', &'0')));
         assert_eq!(iter.next(), None);
         assert_eq!(iter.next_back(), None);
     }
