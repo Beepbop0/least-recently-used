@@ -411,6 +411,7 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
             self.prev.map(|mut node| unsafe {
                 let ret = (&node.as_ref().key, &mut node.as_mut().val);
                 self.prev = node.as_mut().prev;
+                self.len -= 1;
                 ret
             })
         }
