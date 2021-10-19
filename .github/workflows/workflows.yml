@@ -29,6 +29,6 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
     - name: Run tests with valgrind
-      run: valgrind --help && cargo install cargo-valgrind && cargo valgrind test --verbose
+      run: sudo apt install -y valgrind && cargo install cargo-valgrind && cargo valgrind test --verbose
     - name: Run tests in Miri
       run: cargo +nightly miri test
