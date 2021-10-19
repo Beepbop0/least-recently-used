@@ -282,7 +282,12 @@ where
 
 impl<K, V> Drop for LRUCache<K, V> {
     fn drop(&mut self) {
-        self.clear()
+        for (_, node) in self.cache.drain() {
+            unsafe {
+                self.list.unlink(node);
+                let _ = Box::from_raw(node.as_ptr());
+            }
+        }
     }
 }
 
