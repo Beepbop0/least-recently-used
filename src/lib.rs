@@ -238,7 +238,7 @@ where
                 Some(old_val)
             }
         } else {
-            let (key_ref, new_node) = if self.cache.len() + 1 > self.cap.get() {
+            let (key_ref, new_node) = if self.cache.len() == self.cap.get() {
                 unsafe {
                     // SAFETY: the above condition + non-zero capacity means we should never pop a null node
                     let lru_key = &self.list.pop_back().unwrap().as_ref().key;
